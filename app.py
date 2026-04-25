@@ -1,3 +1,4 @@
+from sentiment import get_altcoin_hype, sentiment_gate, get_funding_rates
 """
 加密货币实战信号监控看板
 初始资金: 100 USDT | GitHub Codespaces 版
@@ -679,5 +680,58 @@ with col_log:
     st.subheader("📋 运行日志")
     for log_line in st.session_state.scan_log[:10]:
         st.caption(log_line)
+# ============================================================
+# 全网情绪热力图
+# ============================================================
+st.subheader("🌡️ 全网情绪热力图")
 
+with st.spinner("获取涨幅榜情绪数据..."):
+    hype_data = get_altcoin_hype()
+
+if hype_data:
+    hype_df = pd.DataFrame(hype_data)
+
+    # 热力图
+    fig_heat = go.Figure(go.Treemap(
+        labels=[f"{r['symbol']}<br>{r['sentiment']:+.2f}" for _, r in hype_df.iterrows()],
+        parents=[""] * len(hype_df),
+        values=[abs(r["change_pct"]) + 0.1 for _, r in hype_df.iterrows()],
+        customdata=hype_df[["change_pct", "news_score", "funding_rate", "signal"]].values,
+        hovertemplate=(
+            "<b>%{label}</b><br>"
+            "涨跌幅: %{customdata[0]:+.2f}%<br>"
+            "新闻情绪: %{customdata[1]:+.3f}<br>"
+            "资金费率: %{customdata[2]:+.4f}%<br>"
+            "信号: %{customdata[3]}<extra></extra>"
+        ),
+        marker=dict(
+            colors=[r["sentiment"] for _, r in hype_df.iterrows()],
+            colorscale=[[0, "#f78166"], [0.5, "#30363d"], [1, "#3fb950"]],
+            cmin=-1, cmax=1,
+            showscale=True,
+            colorbar=dict(title="情绪分", tickvals=[-1, 0, 1],
+                          ticktext=["极度悲观", "中性", "极度乐观"])
+        )
+    ))
+    fig_heat.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        font_color="#e6edf3",
+        height=380,
+        margin=dict(l=0, r=0, t=10, b=0)
+    )
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+    # 明细表
+    display_cols = {
+        "symbol": "币种", "change_pct": "24h涨跌%",
+        "news_score": "新闻情绪", "funding_rate": "资金费率%",
+        "sentiment": "综合情绪分", "signal": "信号"
+    }
+    st.dataframe(
+        hype_df.rename(columns=display_cols),
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.info("暂无情绪数据，检查网络连接")
 st.caption("⚠️ 模拟盘仅供学习测试，不构成投资建议")
