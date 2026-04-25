@@ -477,8 +477,10 @@ else:
 col_s, col_l = st.columns(2)
 with col_s:
     st.subheader("📡 本轮信号")
-    st.dataframe(pd.DataFrame(new_signals), use_container_width=True,
-                 hide_index=True) if new_signals else st.info("无新信号")
+if new_signals:
+        st.dataframe(pd.DataFrame(new_signals), use_container_width=True, hide_index=True)
+    else:
+        st.info("无新信号")
 with col_l:
     st.subheader("📋 运行日志")
     for line in st.session_state.scan_log[:10]:
