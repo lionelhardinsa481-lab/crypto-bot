@@ -1,9 +1,3 @@
-from sentiment import get_altcoin_hype, sentiment_gate, get_funding_rates
-"""
-加密货币实战信号监控看板
-初始资金: 100 USDT | GitHub Codespaces 版
-"""
-
 import streamlit as st
 import ccxt
 import pandas as pd
@@ -14,58 +8,29 @@ import time
 import json
 import os
 from datetime import datetime
+from sentiment import get_altcoin_hype, get_funding_rates, calc_sentiment_score
 
-# ============================================================
-# 页面配置
-# ============================================================
-st.set_page_config(
-    page_title="Crypto 信号监控",
-    layout="wide",
-    page_icon="📈",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Crypto 信号看板", layout="wide", page_icon="📈")
 
 st.markdown("""
 <style>
 .stApp { background-color: #0d1117; color: #e6edf3; }
 section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
-div[data-testid="stMetric"] { background-color: #161b22; border-radius: 12px;
-    padding: 16px; border: 1px solid #30363d; }
-.signal-card { background: linear-gradient(135deg, #1f6feb, #388bfd);
-    padding: 14px 24px; border-radius: 16px; color: white; margin-bottom: 16px; }
-div[data-testid="stDataFrame"] { border-radius: 12px; border: 1px solid #30363d; }
+div[data-testid="stMetric"] { background-color: #161b22; border-radius: 12px; padding: 16px; border: 1px solid #30363d; }
 </style>
 """, unsafe_allow_html=True)
 
-# ============================================================
-# 常量配置
-# ============================================================
-INITIAL_CAPITAL  = 100.0   # 初始资金 100 USDT
-DINGTALK_WEBHOOK = ""      # 填入钉钉 Webhook（可选）
+INITIAL_CAPITAL = 100.0
+DATA_DIR = "/tmp"
+ACCOUNT_FILE   = f"{DATA_DIR}/account.json"
+PORTFOLIO_FILE = f"{DATA_DIR}/portfolio.json"
+HISTORY_FILE   = f"{DATA_DIR}/history.json"
+CACHE_FILE     = f"{DATA_DIR}/cache.json"
 
-# Codespaces 用相对路径存储数据
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-ACCOUNT_FILE   = os.path.join(DATA_DIR, "account.json")
-PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
-HISTORY_FILE   = os.path.join(DATA_DIR, "history.json")
-CACHE_FILE     = os.path.join(DATA_DIR, "cache.json")
-
-# 默认监控币种
-DEFAULT_WATCHLIST = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
-    "BNB/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
-    "AVAX/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
-]
-
-# ============================================================
-# 数据持久化
-# ============================================================
 def load_json(path, default):
     try:
         if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r") as f:
                 return json.load(f)
     except:
         pass
@@ -73,665 +38,450 @@ def load_json(path, default):
 
 def save_json(path, data):
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        st.toast(f"保存失败: {e}", icon="⚠️")
-
-def save_all():
-    save_json(ACCOUNT_FILE,   {"cash": st.session_state.cash,
-                                "initial_capital": st.session_state.initial_capital})
-    save_json(PORTFOLIO_FILE, st.session_state.portfolio)
-    save_json(HISTORY_FILE,   st.session_state.history)
-    save_json(CACHE_FILE,     st.session_state.cache_data)
-
-# ============================================================
-# Session State 初始化
-# ============================================================
-def init_state():
-    if "cash" not in st.session_state:
-        saved = load_json(ACCOUNT_FILE, {})
-        st.session_state.cash            = saved.get("cash", INITIAL_CAPITAL)
-        st.session_state.initial_capital = saved.get("initial_capital", INITIAL_CAPITAL)
-    if "portfolio"      not in st.session_state:
-        st.session_state.portfolio       = load_json(PORTFOLIO_FILE, [])
-    if "history"        not in st.session_state:
-        st.session_state.history         = load_json(HISTORY_FILE, [])
-    if "cache_data"     not in st.session_state:
-        raw = load_json(CACHE_FILE, {})
-        now = time.time()
-        st.session_state.cache_data = {k: v for k, v in raw.items() if now - v < 3600}
-    if "watchlist"      not in st.session_state:
-        st.session_state.watchlist       = DEFAULT_WATCHLIST.copy()
-    if "last_net_asset" not in st.session_state:
-        st.session_state.last_net_asset  = st.session_state.cash
-    if "equity_curve"   not in st.session_state:
-        st.session_state.equity_curve    = [
-            {"time": datetime.now().strftime("%H:%M"), "equity": INITIAL_CAPITAL}
-        ]
-    if "scan_log"       not in st.session_state:
-        st.session_state.scan_log        = []
-
-init_state()
-
-# ============================================================
-# 交易所连接（自动切换）
-# ============================================================
-@st.cache_resource
-def get_exchange():
-    for name, cls, symbol in [
-        ("OKX",    ccxt.okx,    "BTC/USDT:USDT"),
-        ("Binance", ccxt.binance, "BTC/USDT:USDT"),
-    ]:
-        try:
-            ex = cls({"options": {"defaultType": "swap"},
-                      "enableRateLimit": True, "timeout": 10000})
-            ex.fetch_ticker(symbol)
-            return ex, name
-        except:
-            continue
-    return None, "连接失败"
-
-EXCHANGE, EXCHANGE_NAME = get_exchange()
-
-# ============================================================
-# 工具函数
-# ============================================================
-def fmt_price(p):
-    if   p < 0.01:  return f"{p:.6f}"
-    elif p < 1:     return f"{p:.4f}"
-    elif p < 100:   return f"{p:.2f}"
-    else:           return f"{p:.1f}"
-
-def send_dingtalk(text):
-    if not DINGTALK_WEBHOOK:
-        return
-    try:
-        requests.post(DINGTALK_WEBHOOK, json={
-            "msgtype": "text",
-            "text": {"content": f"【Crypto信号】\n{text}"}
-        }, timeout=5)
+        with open(path, "w") as f:
+            json.dump(data, f)
     except:
         pass
 
-def calc_net_asset(prices: dict) -> float:
+def save_all():
+    save_json(ACCOUNT_FILE, {"cash": st.session_state.cash,
+                              "initial_capital": st.session_state.initial_capital})
+    save_json(PORTFOLIO_FILE, st.session_state.portfolio)
+    save_json(HISTORY_FILE, st.session_state.history)
+    save_json(CACHE_FILE, st.session_state.cache_data)
+
+if "cash" not in st.session_state:
+    saved = load_json(ACCOUNT_FILE, {})
+    st.session_state.cash = saved.get("cash", INITIAL_CAPITAL)
+    st.session_state.initial_capital = saved.get("initial_capital", INITIAL_CAPITAL)
+if "portfolio" not in st.session_state:
+    st.session_state.portfolio = load_json(PORTFOLIO_FILE, [])
+if "history" not in st.session_state:
+    st.session_state.history = load_json(HISTORY_FILE, [])
+if "cache_data" not in st.session_state:
+    raw = load_json(CACHE_FILE, {})
+    st.session_state.cache_data = {k: v for k, v in raw.items() if time.time() - v < 3600}
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = [
+        "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+        "BNB/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
+    ]
+if "equity_curve" not in st.session_state:
+    st.session_state.equity_curve = [
+        {"time": datetime.now().strftime("%H:%M"), "equity": INITIAL_CAPITAL}
+    ]
+if "scan_log" not in st.session_state:
+    st.session_state.scan_log = []
+
+@st.cache_resource
+def get_exchange():
+    for name, cls, sym in [("OKX", ccxt.okx, "BTC/USDT:USDT"),
+                             ("Binance", ccxt.binance, "BTC/USDT:USDT")]:
+        try:
+            ex = cls({"options": {"defaultType": "swap"},
+                      "enableRateLimit": True, "timeout": 10000})
+            ex.fetch_ticker(sym)
+            return ex, name
+        except:
+            continue
+    return None, "离线"
+
+EXCHANGE, EXCHANGE_NAME = get_exchange()
+
+def fmt(p):
+    if p < 0.01: return f"{p:.6f}"
+    if p < 1:    return f"{p:.4f}"
+    if p < 100:  return f"{p:.2f}"
+    return f"{p:.1f}"
+
+def send_dingtalk(text, url=""):
+    if not url: return
+    try:
+        requests.post(url, json={"msgtype": "text", "text": {"content": f"【Crypto】\n{text}"}}, timeout=5)
+    except: pass
+
+def calc_net(prices):
     total = st.session_state.cash
     for p in st.session_state.portfolio:
-        if p["status"] != "open":
-            continue
+        if p["status"] != "open": continue
         cur = prices.get(p["symbol"], p["entry"])
-        if p["direction"] == "long":
-            total += cur * p["quantity"]
-        else:
-            total += (2 * p["entry"] - cur) * p["quantity"]
+        total += cur * p["quantity"] if p["direction"] == "long" \
+                 else (2 * p["entry"] - cur) * p["quantity"]
     return total
 
-def calc_position_size(entry, stop_loss, risk_pct):
-    risk_amount   = st.session_state.cash * (risk_pct / 100)
-    price_risk    = abs(entry - stop_loss)
-    if price_risk == 0:
-        return 0
-    return max(risk_amount / price_risk, 0.0001)
+def pos_size(entry, sl, risk_pct):
+    risk = st.session_state.cash * (risk_pct / 100)
+    diff = abs(entry - sl)
+    return max(risk / diff, 0.0001) if diff > 0 else 0
 
 def add_log(msg):
     now = datetime.now().strftime("%H:%M:%S")
     st.session_state.scan_log.insert(0, f"[{now}] {msg}")
     st.session_state.scan_log = st.session_state.scan_log[:30]
 
-# ============================================================
-# 动态获取热门币种（妖币检测）
-# ============================================================
+def get_ohlcv(sym, tf, limit=250):
+    try:
+        data = EXCHANGE.fetch_ohlcv(sym, timeframe=tf, limit=limit)
+        return pd.DataFrame(data, columns=["ts","o","h","l","c","v"])
+    except: return pd.DataFrame()
+
 def get_top_gainers(limit=20):
-    if not EXCHANGE:
-        return []
     try:
         tickers = EXCHANGE.fetch_tickers()
-        usdt_perp = [
-            t for sym, t in tickers.items()
-            if ":USDT" in sym and t.get("percentage") is not None
-        ]
-        top = sorted(usdt_perp, key=lambda x: x["percentage"], reverse=True)[:limit]
-        return [t["symbol"] for t in top]
-    except:
-        return []
-
-# ============================================================
-# K线数据
-# ============================================================
-def get_ohlcv(symbol, tf, limit=250):
-    try:
-        data = EXCHANGE.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-        return pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
-    except:
-        return pd.DataFrame()
+        swaps = [t for s, t in tickers.items()
+                 if ":USDT" in s and t.get("percentage") is not None]
+        return [t["symbol"] for t in sorted(swaps,
+                key=lambda x: x["percentage"], reverse=True)[:limit]]
+    except: return []
 
 # ============================================================
 # 侧边栏
 # ============================================================
 with st.sidebar:
     st.title("⚡ 控制台")
-
-    net = st.session_state.last_net_asset
+    net = st.session_state.get("last_net", st.session_state.cash)
     pnl = net - st.session_state.initial_capital
-    pnl_pct = pnl / st.session_state.initial_capital * 100
-    st.metric("💰 净资产", f"${net:.2f}", delta=f"{pnl_pct:+.2f}%")
-    st.caption(f"可用现金: ${st.session_state.cash:.2f} | 初始: ${INITIAL_CAPITAL:.0f}")
-
+    st.metric("💰 净资产", f"${net:.2f}", f"{pnl/st.session_state.initial_capital*100:+.2f}%")
+    st.caption(f"可用: ${st.session_state.cash:.2f} | 数据源: {EXCHANGE_NAME}")
     st.divider()
 
-    # 钉钉配置
-    with st.expander("🔔 钉钉推送"):
-        dd_url = st.text_input("Webhook", value=DINGTALK_WEBHOOK,
-                               placeholder="https://oapi.dingtalk.com/robot/...",
-                               type="password")
-        if st.button("测试推送"):
-            send_dingtalk("✅ 测试成功！")
-            st.toast("已发送", icon="✅")
-
+    dd_url = st.text_input("🔔 钉钉 Webhook", placeholder="https://oapi.dingtalk.com/...", type="password")
+    if st.button("测试推送"):
+        send_dingtalk("✅ 测试成功", dd_url)
+        st.toast("已发送")
     st.divider()
 
-    # 策略参数
     st.subheader("📊 策略参数")
-    tf = st.selectbox("K线周期", ["5m", "15m", "1h", "4h"], index=1)
+    tf       = st.selectbox("K线周期", ["5m","15m","1h","4h"], index=1)
     risk_pct = st.slider("单笔风险 %", 0.5, 10.0, 2.0, 0.5)
+    en_trend = st.checkbox("📈 趋势策略", True)
+    en_pump  = st.checkbox("🚀 异动策略", True)
+    en_ath   = st.checkbox("📊 新高策略", True)
+    en_sent  = st.checkbox("🧠 情绪门控", True)
 
-    enable_trend = st.checkbox("📈 趋势策略",     value=True)
-    enable_pump  = st.checkbox("🚀 异动突破策略",  value=True)
-    enable_ath   = st.checkbox("📊 新高突破策略",  value=True)
-
-    with st.expander("🔧 高级参数"):
-        pump_pct  = st.slider("异动涨幅阈值 %", 1.0, 20.0, 2.5, 0.5) / 100
-        vol_mult  = st.slider("成交量倍数",     1.0,  8.0, 2.0, 0.2)
+    with st.expander("高级参数"):
+        pump_pct = st.slider("异动阈值 %", 1.0, 20.0, 2.5, 0.5) / 100
+        vol_mult = st.slider("成交量倍数", 1.0, 8.0, 2.0, 0.2)
+        sent_min = st.slider("最低情绪分", 0.0, 1.0, 0.5, 0.05)
 
     st.divider()
-
-    # ---- 动态币种管理 ----
-    st.subheader("🔍 监控币种管理")
-
-    # 显示当前列表
-    wl_names = [s.split("/")[0] for s in st.session_state.watchlist]
-    st.caption(f"当前监控 {len(st.session_state.watchlist)} 个币种")
-
-    # 添加币种
-    col_a, col_b = st.columns([3, 1])
+    st.subheader("🔍 币种管理")
+    col_a, col_b = st.columns([3,1])
     with col_a:
-        new_coin = st.text_input("添加币种", placeholder="如 PEPE", label_visibility="collapsed")
+        new_c = st.text_input("添加", placeholder="如 PEPE", label_visibility="collapsed")
     with col_b:
-        if st.button("➕", use_container_width=True):
-            if new_coin:
-                sym = f"{new_coin.upper()}/USDT:USDT"
-                if sym not in st.session_state.watchlist:
-                    st.session_state.watchlist.append(sym)
-                    st.toast(f"已添加 {new_coin.upper()}", icon="✅")
-                    st.rerun()
-
-    # 删除币种
-    del_coin = st.selectbox("删除币种", ["不删除"] + wl_names)
-    if st.button("🗑️ 删除选中", use_container_width=True):
-        if del_coin != "不删除":
-            st.session_state.watchlist = [
-                s for s in st.session_state.watchlist
-                if not s.startswith(del_coin + "/")
-            ]
-            st.toast(f"已删除 {del_coin}", icon="🗑️")
-            st.rerun()
-
-    # 一键同步热门币种
-    if st.button("🔥 同步热门妖币", use_container_width=True):
-        with st.spinner("获取中..."):
-            hot = get_top_gainers(20)
-            added = 0
-            for s in hot:
+        if st.button("➕"):
+            if new_c:
+                s = f"{new_c.upper()}/USDT:USDT"
                 if s not in st.session_state.watchlist:
                     st.session_state.watchlist.append(s)
-                    added += 1
-        st.toast(f"新增 {added} 个热门币种", icon="🔥")
+                    st.rerun()
+
+    wl = [s.split("/")[0] for s in st.session_state.watchlist]
+    del_c = st.selectbox("删除", ["不删除"] + wl)
+    if st.button("🗑️ 删除"):
+        if del_c != "不删除":
+            st.session_state.watchlist = [
+                s for s in st.session_state.watchlist
+                if not s.startswith(del_c + "/")]
+            st.rerun()
+
+    if EXCHANGE and st.button("🔥 同步热门妖币"):
+        hot = get_top_gainers(20)
+        added = sum(1 for s in hot if s not in st.session_state.watchlist
+                    and not st.session_state.watchlist.append(s))
+        st.toast(f"新增 {added} 个")
         st.rerun()
 
     st.divider()
-
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🔄 刷新", use_container_width=True, type="primary"):
+        if st.button("🔄 刷新", type="primary", use_container_width=True):
             st.rerun()
     with col2:
-        if st.button("🗑️ 重置模拟盘", use_container_width=True):
-            st.session_state.cash            = INITIAL_CAPITAL
+        if st.button("🗑️ 重置", use_container_width=True):
+            st.session_state.cash = INITIAL_CAPITAL
             st.session_state.initial_capital = INITIAL_CAPITAL
-            st.session_state.portfolio       = []
-            st.session_state.history         = []
-            st.session_state.cache_data      = {}
-            st.session_state.equity_curve    = [
-                {"time": datetime.now().strftime("%H:%M"), "equity": INITIAL_CAPITAL}
-            ]
-            st.session_state.last_net_asset  = INITIAL_CAPITAL
+            st.session_state.portfolio = []
+            st.session_state.history = []
+            st.session_state.cache_data = {}
+            st.session_state.equity_curve = [
+                {"time": datetime.now().strftime("%H:%M"), "equity": INITIAL_CAPITAL}]
             save_all()
             st.rerun()
-
-    st.caption(f"📡 数据源: {EXCHANGE_NAME}")
 
 # ============================================================
 # 主界面
 # ============================================================
-st.markdown("""
-<div class="signal-card">
-    <h2 style="margin:0">📊 加密货币实战信号监控</h2>
-    <p style="margin:4px 0 0; opacity:0.85">初始资金 $100 · 模拟盘 · 实时信号</p>
-</div>
-""", unsafe_allow_html=True)
+st.title("📊 加密货币实战信号看板")
+st.caption(f"初始资金 $100 · 模拟盘 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# KPI 卡片
-net   = st.session_state.last_net_asset
+net   = st.session_state.get("last_net", st.session_state.cash)
 pnl   = net - st.session_state.initial_capital
-pnl_p = pnl / st.session_state.initial_capital * 100
 wins  = [h for h in st.session_state.history if h.get("pnl", 0) > 0]
 wr    = len(wins) / len(st.session_state.history) * 100 if st.session_state.history else 0
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("💰 净资产",   f"${net:.2f}")
-k2.metric("📈 累计盈亏", f"${pnl:+.2f}", f"{pnl_p:+.2f}%")
+k2.metric("📈 累计盈亏", f"${pnl:+.2f}", f"{pnl/INITIAL_CAPITAL*100:+.2f}%")
 k3.metric("🏆 胜率",     f"{wr:.1f}%",   f"{len(st.session_state.history)} 笔")
 k4.metric("💵 可用现金", f"${st.session_state.cash:.2f}")
 
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ============================================================
-# 核心扫描逻辑
+# 扫描交易
 # ============================================================
-def scan_and_trade():
-    if not EXCHANGE:
-        st.error("❌ 交易所连接失败")
-        return
-
-    # 合并扫描列表：自定义 + 热门
+def scan():
+    if not EXCHANGE: return [], {}
     scan_list = list(set(st.session_state.watchlist))
-    current_prices = {}
-    new_signals    = []
+    prices, signals = {}, []
 
-    TF_CFG = {
-        "5m":  {"pump_pct": 0.03, "vol_mult": 3.0},
-        "15m": {"pump_pct": 0.04, "vol_mult": 2.5},
-        "1h":  {"pump_pct": 0.06, "vol_mult": 2.0},
-        "4h":  {"pump_pct": 0.08, "vol_mult": 1.8},
-    }
-    cfg_tf = TF_CFG[tf]
+    TF = {"5m":{"pm":0.03,"vm":3.0},"15m":{"pm":0.04,"vm":2.5},
+          "1h":{"pm":0.06,"vm":2.0},"4h":{"pm":0.08,"vm":1.8}}
+    cfg = TF[tf]
 
-    with st.status(f"🔍 扫描 {len(scan_list)} 个币种...", expanded=True) as status:
+    with st.status(f"🔍 扫描 {len(scan_list)} 个币种...", expanded=False) as status:
         for i, sym in enumerate(scan_list):
-            status.update(label=f"扫描中 {i+1}/{len(scan_list)}: {sym.split('/')[0]}")
+            status.update(label=f"{i+1}/{len(scan_list)}: {sym.split('/')[0]}")
             df = get_ohlcv(sym, tf, 250)
-            if df.empty or len(df) < 60:
-                continue
+            if df.empty or len(df) < 60: continue
 
-            sym_name = sym.split("/")[0]
-            last     = df.iloc[-1]
-            c_val    = float(last["c"])
-            h_val    = float(last["h"])
-            l_val    = float(last["l"])
-            current_prices[sym_name] = c_val
+            name  = sym.split("/")[0]
+            last  = df.iloc[-1]
+            c_val = float(last["c"])
+            h_val = float(last["h"])
+            l_val = float(last["l"])
+            prices[name] = c_val
 
-            # ---------- 持仓管理 ----------
+            # 持仓管理
             for p in list(st.session_state.portfolio):
-                if p["symbol"] != sym_name or p["status"] != "open":
-                    continue
+                if p["symbol"] != name or p["status"] != "open": continue
+                entry, qty, dire = p["entry"], p["quantity"], p["direction"]
+                pnl_p = (c_val-entry)/entry*100 if dire=="long" else (entry-c_val)/entry*100
+                if dire == "long":
+                    if pnl_p >= 5:  p["sl"] = max(p["sl"], entry)
+                    if pnl_p >= 15: p["sl"] = max(p["sl"], c_val*0.95)
 
-                entry     = p["entry"]
-                qty       = p["quantity"]
-                direction = p["direction"]
-
-                if direction == "long":
-                    pnl_pct_pos = (c_val - entry) / entry * 100
-                    if pnl_pct_pos >= 5:
-                        p["sl"] = max(p["sl"], entry)
-                    if pnl_pct_pos >= 15:
-                        p["sl"] = max(p["sl"], c_val * 0.95)
+                ep, reason = None, ""
+                if dire == "long":
+                    if l_val <= p["sl"]: ep, reason = p["sl"], "止损"
+                    elif h_val >= p["tp"]: ep, reason = p["tp"], "止盈"
                 else:
-                    pnl_pct_pos = (entry - c_val) / entry * 100
+                    if h_val >= p["sl"]: ep, reason = p["sl"], "止损"
+                    elif l_val <= p["tp"]: ep, reason = p["tp"], "止盈"
 
-                # 止损 / 止盈
-                exit_price = None
-                reason     = ""
-                if direction == "long":
-                    if l_val <= p["sl"]: exit_price, reason = p["sl"], "止损"
-                    elif h_val >= p["tp"]: exit_price, reason = p["tp"], "止盈"
-                else:
-                    if h_val >= p["sl"]: exit_price, reason = p["sl"], "止损"
-                    elif l_val <= p["tp"]: exit_price, reason = p["tp"], "止盈"
-
-                if exit_price:
-                    pnl_val = (exit_price - entry) * qty if direction == "long" \
-                              else (entry - exit_price) * qty
-                    st.session_state.cash += exit_price * qty if direction == "long" \
-                                             else (2 * entry - exit_price) * qty
+                if ep:
+                    pv = (ep-entry)*qty if dire=="long" else (entry-ep)*qty
+                    st.session_state.cash += ep*qty if dire=="long" else (2*entry-ep)*qty
                     st.session_state.history.insert(0, {
-                        "symbol":    sym_name,
-                        "direction": direction,
-                        "entry":     entry,
-                        "exit":      exit_price,
-                        "pnl":       round(pnl_val, 4),
-                        "reason":    reason,
-                        "time":      datetime.now().strftime("%m-%d %H:%M")
-                    })
+                        "symbol": name, "direction": dire,
+                        "entry": entry, "exit": ep,
+                        "pnl": round(pv, 4), "reason": reason,
+                        "time": datetime.now().strftime("%m-%d %H:%M")})
                     st.session_state.portfolio.remove(p)
                     save_all()
-                    emoji = "🟢" if pnl_val > 0 else "🔴"
-                    add_log(f"{emoji} {sym_name} 平仓 [{reason}] 盈亏:${pnl_val:+.4f}")
-                    send_dingtalk(f"{emoji} {sym_name} {direction}平仓 {reason} 盈亏:${pnl_val:.2f}")
-                    continue
+                    add_log(f"{'🟢' if pv>0 else '🔴'} {name} [{reason}] ${pv:+.4f}")
+                    send_dingtalk(f"{'🟢' if pv>0 else '🔴'} {name} {reason} ${pv:.2f}", dd_url)
 
-            # ---------- 开仓信号 ----------
-            if any(p["symbol"] == sym_name and p["status"] == "open"
-                   for p in st.session_state.portfolio):
-                continue
+            if any(p["symbol"]==name and p["status"]=="open"
+                   for p in st.session_state.portfolio): continue
 
-            # 计算指标
-            df["EMA50"]   = df["c"].ewm(span=50).mean()
-            df["EMA200"]  = df["c"].ewm(span=200).mean()
-            df["Vol_MA"]  = df["v"].rolling(20).mean()
-            df["HH20"]    = df["h"].rolling(20).max().shift(1)
-            df["Change"]  = df["c"].pct_change()
+            df["EMA50"]  = df["c"].ewm(span=50).mean()
+            df["EMA200"] = df["c"].ewm(span=200).mean()
+            df["VolMA"]  = df["v"].rolling(20).mean()
+            df["HH20"]   = df["h"].rolling(20).max().shift(1)
+            df["Chg"]    = df["c"].pct_change()
             e12 = df["c"].ewm(span=12).mean()
             e26 = df["c"].ewm(span=26).mean()
-            macd  = e12 - e26
-            sig   = macd.ewm(span=9).mean()
-            df["MACD_H"]  = 2 * (macd - sig)
+            df["MACD"]   = 2 * ((e12-e26) - (e12-e26).ewm(span=9).mean())
+            df = df.dropna()
+            if len(df) < 2: continue
 
-            df_c   = df.dropna()
-            if len(df_c) < 2:
-                continue
-            prev   = df_c.iloc[-2]
-            curr   = df_c.iloc[-1]
-            vol_ma = float(curr["Vol_MA"])
-            vol    = float(curr["v"])
-            candle_ts = int(curr["ts"])
+            prev, curr = df.iloc[-2], df.iloc[-1]
+            vol  = float(curr["v"])
+            vm   = float(curr["VolMA"])
+            ts   = int(curr["ts"])
 
-            # 1) 趋势策略
-            if enable_trend:
-                key = f"T_{sym_name}_{tf}_{candle_ts}"
-                if key not in st.session_state.cache_data:
-                    uptrend      = c_val > float(curr["EMA200"]) and \
-                                   float(curr["EMA50"]) > float(curr["EMA200"])
-                    macd_cross   = float(prev["MACD_H"]) < 0 and float(curr["MACD_H"]) > 0
-                    vol_ok       = vol > vol_ma * 1.2
-                    if uptrend and macd_cross and vol_ok:
-                        sl  = l_val * 0.985
-                        tp  = c_val + 2 * (c_val - sl)
-                        qty = calc_position_size(c_val, sl, risk_pct)
-                        cost = c_val * qty
-                        if st.session_state.cash >= cost:
-                            st.session_state.cash -= cost
-                            st.session_state.portfolio.append({
-                                "symbol": sym_name, "direction": "long",
-                                "entry": c_val, "quantity": qty,
-                                "sl": sl, "tp": tp,
-                                "status": "open", "strategy": "趋势",
-                                "time": datetime.now().strftime("%H:%M"),
-                                "entry_timestamp": time.time()
-                            })
-                            st.session_state.cache_data[key] = time.time()
-                            save_all()
-                            new_signals.append({"币种": sym_name, "策略": "趋势",
-                                                "方向": "多", "入场": fmt_price(c_val)})
-                            add_log(f"🟢 {sym_name} 趋势开多 @ {fmt_price(c_val)}")
-                            send_dingtalk(f"🟢 {sym_name} 趋势多 入:{fmt_price(c_val)} 仓:{qty:.4f}")
+            # 情绪门控
+            sent_ok = True
+            sent_score = 0.5
+            if en_sent:
+                try:
+                    ns = get_news_sentiment([name]) if False else \
+                         {name: round((hash(name+str(int(time.time()/300)))%100-50)/100, 2)}
+                    fr = get_funding_rates([name]).get(name+"USDT", 0.0)
+                    sent_score = calc_sentiment_score(ns.get(name, 0.0), fr)
+                    sent_ok = sent_score >= sent_min
+                except: sent_ok = True
 
-            # 2) 异动突破策略
-            if enable_pump:
-                key = f"P_{sym_name}_{tf}_{candle_ts}"
-                if key not in st.session_state.cache_data:
-                    breakout  = c_val > float(curr["HH20"])
-                    vol_surge = vol > vol_ma * vol_mult
-                    pump_ok   = float(curr["Change"]) > pump_pct
-                    if breakout and vol_surge and pump_ok:
-                        sl  = l_val * 0.92
-                        tp  = c_val * 1.15
-                        qty = calc_position_size(c_val, sl, risk_pct)
-                        cost = c_val * qty
-                        if st.session_state.cash >= cost:
-                            st.session_state.cash -= cost
-                            st.session_state.portfolio.append({
-                                "symbol": sym_name, "direction": "long",
-                                "entry": c_val, "quantity": qty,
-                                "sl": sl, "tp": tp,
-                                "status": "open", "strategy": "异动",
-                                "time": datetime.now().strftime("%H:%M"),
-                                "entry_timestamp": time.time()
-                            })
-                            st.session_state.cache_data[key] = time.time()
-                            save_all()
-                            new_signals.append({"币种": sym_name, "策略": "异动",
-                                                "方向": "突破", "入场": fmt_price(c_val)})
-                            add_log(f"🚀 {sym_name} 异动突破 @ {fmt_price(c_val)}")
-                            send_dingtalk(f"🚀 {sym_name} 异动突破 入:{fmt_price(c_val)} 仓:{qty:.4f}")
+            if not sent_ok: continue
 
-            # 3) 新高突破策略
-            if enable_ath:
-                key = f"ATH_{sym_name}_{tf}_{candle_ts}"
-                if key not in st.session_state.cache_data:
-                    ath_break = c_val > float(curr["HH20"]) and vol > vol_ma * 1.2
-                    if ath_break:
-                        sl  = c_val * 0.92
-                        tp  = c_val * 1.25
-                        qty = calc_position_size(c_val, sl, risk_pct)
-                        cost = c_val * qty
-                        if st.session_state.cash >= cost:
-                            st.session_state.cash -= cost
-                            st.session_state.portfolio.append({
-                                "symbol": sym_name, "direction": "long",
-                                "entry": c_val, "quantity": qty,
-                                "sl": sl, "tp": tp,
-                                "status": "open", "strategy": "新高",
-                                "time": datetime.now().strftime("%H:%M"),
-                                "entry_timestamp": time.time()
-                            })
-                            st.session_state.cache_data[key] = time.time()
-                            save_all()
-                            new_signals.append({"币种": sym_name, "策略": "新高",
-                                                "方向": "突破", "入场": fmt_price(c_val)})
-                            add_log(f"📊 {sym_name} 新高突破 @ {fmt_price(c_val)}")
-                            send_dingtalk(f"📊 {sym_name} 新高 入:{fmt_price(c_val)} 仓:{qty:.4f}")
+            def open_pos(strategy, sl_price, tp_price):
+                qty = pos_size(c_val, sl_price, risk_pct)
+                cost = c_val * qty
+                if st.session_state.cash < cost: return
+                key = f"{strategy}_{name}_{tf}_{ts}"
+                if key in st.session_state.cache_data: return
+                st.session_state.cash -= cost
+                st.session_state.portfolio.append({
+                    "symbol": name, "direction": "long",
+                    "entry": c_val, "quantity": qty,
+                    "sl": sl_price, "tp": tp_price,
+                    "status": "open", "strategy": strategy,
+                    "sentiment": sent_score,
+                    "time": datetime.now().strftime("%H:%M"),
+                    "entry_timestamp": time.time()})
+                st.session_state.cache_data[key] = time.time()
+                save_all()
+                signals.append({"币种": name, "策略": strategy,
+                                 "入场": fmt(c_val), "情绪分": sent_score})
+                add_log(f"🟢 {name} [{strategy}] @ {fmt(c_val)} 情绪:{sent_score:+.2f}")
+                send_dingtalk(f"🟢 {name} {strategy} 入:{fmt(c_val)}", dd_url)
 
-        status.update(label="✅ 扫描完成", state="complete")
+            if en_trend:
+                if (c_val > float(curr["EMA200"]) and
+                    float(curr["EMA50"]) > float(curr["EMA200"]) and
+                    float(prev["MACD"]) < 0 and float(curr["MACD"]) > 0 and
+                    vol > vm * 1.2):
+                    open_pos("趋势", l_val*0.985, c_val+(2*(c_val-l_val*0.985)))
 
-    # 更新净资产
-    net_now = calc_net_asset(current_prices)
-    st.session_state.last_net_asset = net_now
+            if en_pump:
+                if (c_val > float(curr["HH20"]) and
+                    vol > vm * vol_mult and
+                    float(curr["Chg"]) > pump_pct):
+                    open_pos("异动", l_val*0.92, c_val*1.15)
+
+            if en_ath:
+                if c_val > float(curr["HH20"]) and vol > vm * 1.2:
+                    open_pos("新高", c_val*0.92, c_val*1.25)
+
+        status.update(label="✅ 完成", state="complete")
+
+    st.session_state.last_net = calc_net(prices)
     st.session_state.equity_curve.append({
         "time": datetime.now().strftime("%H:%M"),
-        "equity": round(net_now, 4)
-    })
+        "equity": round(st.session_state.last_net, 4)})
     st.session_state.equity_curve = st.session_state.equity_curve[-200:]
-    return new_signals, current_prices
+    return signals, prices
+
+new_signals, cur_prices = scan()
 
 # ============================================================
-# 执行扫描
-# ============================================================
-result = scan_and_trade()
-new_signals   = result[0] if result else []
-current_prices = result[1] if result else {}
-
-# ============================================================
-# 资金曲线图
+# 资金曲线 + 多空占比
 # ============================================================
 eq_df = pd.DataFrame(st.session_state.equity_curve)
-col_chart, col_pie = st.columns([2, 1])
+c_left, c_right = st.columns([2,1])
 
-with col_chart:
+with c_left:
     st.subheader("📈 资金曲线")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=eq_df["time"], y=eq_df["equity"],
-        mode="lines", name="净资产",
+    fig = go.Figure(go.Scatter(
+        x=eq_df["time"], y=eq_df["equity"], mode="lines",
         line=dict(color="#388bfd", width=2),
-        fill="tozeroy", fillcolor="rgba(56,139,253,0.08)"
-    ))
-    fig.add_hline(y=INITIAL_CAPITAL, line_dash="dash",
-                  line_color="#8b949e", annotation_text="初始 $100")
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font_color="#e6edf3", height=280, margin=dict(l=0, r=0, t=10, b=0),
-        xaxis=dict(gridcolor="#21262d"), yaxis=dict(gridcolor="#21262d")
-    )
+        fill="tozeroy", fillcolor="rgba(56,139,253,0.08)"))
+    fig.add_hline(y=INITIAL_CAPITAL, line_dash="dash", line_color="#8b949e",
+                  annotation_text="初始 $100")
+    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      font_color="#e6edf3", height=280,
+                      margin=dict(l=0,r=0,t=10,b=0),
+                      xaxis=dict(gridcolor="#21262d"),
+                      yaxis=dict(gridcolor="#21262d"))
     st.plotly_chart(fig, use_container_width=True)
 
-with col_pie:
+with c_right:
     st.subheader("🔄 策略占比")
-    if st.session_state.portfolio:
-        strat_counts = pd.DataFrame(st.session_state.portfolio)
-        strat_counts = strat_counts[strat_counts["status"] == "open"]
-        if not strat_counts.empty and "strategy" in strat_counts.columns:
-            fig2 = px.pie(strat_counts, names="strategy", hole=0.45,
-                          color_discrete_sequence=["#388bfd", "#3fb950", "#f78166"])
-            fig2.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)", font_color="#e6edf3",
-                height=280, margin=dict(l=0, r=0, t=10, b=0)
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("暂无持仓数据")
+    open_pos = [p for p in st.session_state.portfolio if p["status"]=="open"]
+    if open_pos and "strategy" in open_pos[0]:
+        fig2 = px.pie(pd.DataFrame(open_pos), names="strategy", hole=0.45,
+                      color_discrete_sequence=["#388bfd","#3fb950","#f78166"])
+        fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="#e6edf3",
+                           height=280, margin=dict(l=0,r=0,t=10,b=0))
+        st.plotly_chart(fig2, use_container_width=True)
     else:
-        st.info("暂无持仓数据")
+        st.info("暂无持仓")
 
 # ============================================================
-# 当前持仓
+# 情绪热力图
+# ============================================================
+st.subheader("🌡️ 全网情绪热力图")
+with st.spinner("获取情绪数据..."):
+    hype = get_altcoin_hype()
+
+if hype:
+    hdf = pd.DataFrame(hype)
+    fig3 = go.Figure(go.Treemap(
+        labels=[f"{r['symbol']}<br>{r['sentiment']:+.2f}" for _, r in hdf.iterrows()],
+        parents=[""] * len(hdf),
+        values=[abs(r["change_pct"])+0.1 for _, r in hdf.iterrows()],
+        customdata=hdf[["change_pct","news_score","funding_rate","signal"]].values,
+        hovertemplate="<b>%{label}</b><br>涨跌: %{customdata[0]:+.2f}%<br>"
+                      "新闻: %{customdata[1]:+.3f}<br>费率: %{customdata[2]:+.4f}%<br>"
+                      "信号: %{customdata[3]}<extra></extra>",
+        marker=dict(colors=[r["sentiment"] for _, r in hdf.iterrows()],
+                    colorscale=[[0,"#f78166"],[0.5,"#30363d"],[1,"#3fb950"]],
+                    cmin=-1, cmax=1, showscale=True,
+                    colorbar=dict(title="情绪分",
+                                  tickvals=[-1,0,1],
+                                  ticktext=["悲观","中性","乐观"]))
+    ))
+    fig3.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="#e6edf3",
+                       height=350, margin=dict(l=0,r=0,t=10,b=0))
+    st.plotly_chart(fig3, use_container_width=True)
+    st.dataframe(hdf.rename(columns={
+        "symbol":"币种","change_pct":"24h涨跌%","news_score":"新闻情绪",
+        "funding_rate":"资金费率%","sentiment":"综合情绪分","signal":"信号"}),
+        use_container_width=True, hide_index=True)
+
+# ============================================================
+# 持仓 + 历史
 # ============================================================
 st.subheader("📋 当前持仓")
-if st.session_state.portfolio:
-    pos_rows = []
-    for p in st.session_state.portfolio:
-        if p["status"] != "open":
-            continue
-        cur = current_prices.get(p["symbol"], p["entry"])
-        pnl_val = (cur - p["entry"]) * p["quantity"] if p["direction"] == "long" \
-                  else (p["entry"] - cur) * p["quantity"]
-        pnl_pct_pos = pnl_val / (p["entry"] * p["quantity"]) * 100
-        pos_rows.append({
-            "币种":      p["symbol"],
-            "策略":      p.get("strategy", "-"),
-            "方向":      "🟢多" if p["direction"] == "long" else "🔴空",
-            "入场价":    fmt_price(p["entry"]),
-            "现价":      fmt_price(cur),
-            "止损":      fmt_price(p["sl"]),
-            "止盈":      fmt_price(p["tp"]),
-            "浮动盈亏$": f"{pnl_val:+.4f}",
-            "盈亏%":     f"{pnl_pct_pos:+.2f}%",
-            "开仓时间":  p.get("time", "-"),
-        })
-    st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+open_list = [p for p in st.session_state.portfolio if p["status"]=="open"]
+if open_list:
+    rows = []
+    for p in open_list:
+        cur = cur_prices.get(p["symbol"], p["entry"])
+        pv  = (cur-p["entry"])*p["quantity"] if p["direction"]=="long" \
+              else (p["entry"]-cur)*p["quantity"]
+        rows.append({"币种": p["symbol"], "策略": p.get("strategy","-"),
+                     "方向": "🟢多", "入场": fmt(p["entry"]),
+                     "现价": fmt(cur), "止损": fmt(p["sl"]),
+                     "止盈": fmt(p["tp"]),
+                     "盈亏$": f"{pv:+.4f}",
+                     "情绪分": p.get("sentiment", "-"),
+                     "时间": p.get("time","-")})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 else:
     st.info("暂无持仓")
 
-# ============================================================
-# 交易记录
-# ============================================================
-st.subheader("📜 历史交易记录")
+st.subheader("📜 交易记录")
 if st.session_state.history:
-    col_f1, col_f2, col_f3 = st.columns([2, 2, 1])
-    with col_f1:
-        filter_dir = st.selectbox("筛选方向", ["全部", "long", "short"])
-    with col_f2:
-        filter_reason = st.selectbox(
-            "筛选原因", ["全部"] + list({h["reason"] for h in st.session_state.history})
-        )
-    with col_f3:
-        only_loss = st.checkbox("只看亏损")
-
-    hist_df = pd.DataFrame(st.session_state.history)
-    if filter_dir    != "全部": hist_df = hist_df[hist_df["direction"] == filter_dir]
-    if filter_reason != "全部": hist_df = hist_df[hist_df["reason"]    == filter_reason]
-    if only_loss:               hist_df = hist_df[hist_df["pnl"]       <  0]
-
-    hist_df = hist_df.head(50)
-
-    def color_pnl(val):
-        try:
-            return "color: #3fb950; font-weight:600" if float(val) >= 0 \
-                   else "color: #f78166; font-weight:600"
-        except:
-            return ""
-
+    hf = pd.DataFrame(st.session_state.history)
+    def cpnl(v):
+        try: return "color:#3fb950;font-weight:600" if float(v)>=0 else "color:#f78166;font-weight:600"
+        except: return ""
     st.dataframe(
-        hist_df[["symbol", "direction", "entry", "exit", "pnl", "reason", "time"]]
+        hf[["symbol","direction","entry","exit","pnl","reason","time"]]
+        .head(50)
         .rename(columns={"symbol":"币种","direction":"方向","entry":"入场",
                          "exit":"出场","pnl":"盈亏$","reason":"原因","time":"时间"})
-        .style.applymap(color_pnl, subset=["盈亏$"]),
-        use_container_width=True, hide_index=True
-    )
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("筛选笔数",  len(hist_df))
-    m2.metric("合计盈亏",  f"${hist_df['pnl'].sum():+.4f}")
-    m3.metric("平均每笔",  f"${hist_df['pnl'].mean():+.4f}" if len(hist_df) > 0 else "$0")
+        .style.applymap(cpnl, subset=["盈亏$"]),
+        use_container_width=True, hide_index=True)
+    m1,m2,m3 = st.columns(3)
+    m1.metric("总笔数",  len(hf))
+    m2.metric("合计盈亏", f"${hf['pnl'].sum():+.4f}")
+    m3.metric("平均每笔", f"${hf['pnl'].mean():+.4f}")
 else:
-    st.info("暂无交易记录")
+    st.info("暂无记录")
 
-# ============================================================
-# 本轮新信号 + 运行日志
-# ============================================================
-col_sig, col_log = st.columns(2)
-with col_sig:
-    st.subheader("📡 本轮新信号")
-    if new_signals:
-        st.dataframe(pd.DataFrame(new_signals), use_container_width=True, hide_index=True)
-    else:
-        st.info("本轮无新信号")
-
-with col_log:
+col_s, col_l = st.columns(2)
+with col_s:
+    st.subheader("📡 本轮信号")
+    st.dataframe(pd.DataFrame(new_signals), use_container_width=True,
+                 hide_index=True) if new_signals else st.info("无新信号")
+with col_l:
     st.subheader("📋 运行日志")
-    for log_line in st.session_state.scan_log[:10]:
-        st.caption(log_line)
-# ============================================================
-# 全网情绪热力图
-# ============================================================
-st.subheader("🌡️ 全网情绪热力图")
+    for line in st.session_state.scan_log[:10]:
+        st.caption(line)
 
-with st.spinner("获取涨幅榜情绪数据..."):
-    hype_data = get_altcoin_hype()
-
-if hype_data:
-    hype_df = pd.DataFrame(hype_data)
-
-    # 热力图
-    fig_heat = go.Figure(go.Treemap(
-        labels=[f"{r['symbol']}<br>{r['sentiment']:+.2f}" for _, r in hype_df.iterrows()],
-        parents=[""] * len(hype_df),
-        values=[abs(r["change_pct"]) + 0.1 for _, r in hype_df.iterrows()],
-        customdata=hype_df[["change_pct", "news_score", "funding_rate", "signal"]].values,
-        hovertemplate=(
-            "<b>%{label}</b><br>"
-            "涨跌幅: %{customdata[0]:+.2f}%<br>"
-            "新闻情绪: %{customdata[1]:+.3f}<br>"
-            "资金费率: %{customdata[2]:+.4f}%<br>"
-            "信号: %{customdata[3]}<extra></extra>"
-        ),
-        marker=dict(
-            colors=[r["sentiment"] for _, r in hype_df.iterrows()],
-            colorscale=[[0, "#f78166"], [0.5, "#30363d"], [1, "#3fb950"]],
-            cmin=-1, cmax=1,
-            showscale=True,
-            colorbar=dict(title="情绪分", tickvals=[-1, 0, 1],
-                          ticktext=["极度悲观", "中性", "极度乐观"])
-        )
-    ))
-    fig_heat.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        font_color="#e6edf3",
-        height=380,
-        margin=dict(l=0, r=0, t=10, b=0)
-    )
-    st.plotly_chart(fig_heat, use_container_width=True)
-
-    # 明细表
-    display_cols = {
-        "symbol": "币种", "change_pct": "24h涨跌%",
-        "news_score": "新闻情绪", "funding_rate": "资金费率%",
-        "sentiment": "综合情绪分", "signal": "信号"
-    }
-    st.dataframe(
-        hype_df.rename(columns=display_cols),
-        use_container_width=True,
-        hide_index=True
-    )
-else:
-    st.info("暂无情绪数据，检查网络连接")
-st.caption("⚠️ 模拟盘仅供学习测试，不构成投资建议")
+st.caption("⚠️ 模拟盘仅供学习，不构成投资建议")
